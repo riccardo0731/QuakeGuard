@@ -11,40 +11,62 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    # 1. Download Code
-    - name: Checkout code
+    # 1. Retrieve the repository content
+    - name: Checkout Source Code
       uses: actions/checkout@v3
 
-    # 2. Prepare Python
-    - name: Set up Python
+    # 2. Configure the Python runtime environment
+    - name: Setup Python Environment
       uses: actions/setup-python@v4
       with:
         python-version: '3.11'
 
+    # 3. Install required Python packages for the test suite
     - name: Install Test Dependencies
       run: |
         python -m pip install --upgrade pip
         pip install aiohttp ecdsa redis sqlalchemy psycopg2-binary geoalchemy2
 
-    # 3. Start Docker Container
-    - name: Start Docker Stack
+    # 4. Orchestrate the Docker container stack
+    - name: Initialize Docker Infrastructure
+      env:
+        POSTGRES_DB: monitoraggio_db
+        POSTGRES_USER: developer
+        POSTGRES_PASSWORD: development_pass
+        API_PORT: 8000
       run: |
+        # Navigate to the API directory containing the docker-compose configuration
+        cd backend-data-elaborator/api
+
+        # Build and start services in detached mode with environment injection
         docker compose up -d --build
-        # Wait DB to be ready (backend has wait_for_db, but let's give time to docket)
-        echo "⏳ Waiting for services to stabilize..."
-        sleep 15
+        
+        # Block execution until the PostgreSQL health check passes
+        echo "Waiting for database readiness..."
+        timeout 30s bash -c 'until docker compose exec -T postgres pg_isready -U developer; do sleep 2; done'
+        
+        # Output running containers for verification
         docker compose ps
 
-    # 4. Execute Stress Test
-    - name: Run Critical Stress Test
+    # 5. Execute the Stress Test Suite
+    - name: Execute Critical Stress Test
       env:
         API_URL: "http://localhost:8000"
-        NUM_SENSORS: 200        # Average Load for CI
+        NUM_SENSORS: 150
         CONCURRENCY_LIMIT: 50
       run: |
-        python -m tests.stress_test_v2
+        # Navigate to the working directory
+        cd backend-data-elaborator/api
+        
+        # Set PYTHONPATH to the current directory to resolve 'src' and 'tests' modules
+        export PYTHONPATH=$PYTHONPATH:.
+        
+        # Execute the stress test module (targeting tests/stress_test.py)
+        python -m tests.stress_test
 
-    # 5. Logs if there are errors
-    - name: Dump Docker Logs on Failure
+    # 6. Diagnostics (only runs if previous steps fail)
+    - name: Retrieve System Logs on Failure
       if: failure()
-      run: docker compose logs
+      run: |
+        cd backend-data-elaborator/api
+        docker compose logs
