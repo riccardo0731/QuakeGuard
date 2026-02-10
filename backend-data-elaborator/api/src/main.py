@@ -1,42 +1,45 @@
 """
 QuakeGuard Backend Service API
 -------------------------------
-Orchestrates IoT data ingestion, system health monitoring, and data retrieval.
-Implements robust error handling for cryptographic verification (SHA256, DER/RAW).
+Core API Gateway.
+Responsiblities:
+1. IoT Data Ingestion (ECDSA Validation).
+2. Data Retrieval (REST).
+3. Real-Time Alert Distribution (Redis Pub/Sub -> WebSocket).
 """
 
 import json
 import asyncio
 import time
-import hashlib  
+import hashlib
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc, text
 from sqlalchemy.exc import OperationalError
 from redis import asyncio as aioredis
 
-# --- CRYPTO IMPORTS ---
+# --- CRYPTOGRAPHY ---
 from ecdsa import VerifyingKey, NIST256p, BadSignatureError
 from ecdsa.errors import MalformedPointError
 from ecdsa.util import sigdecode_der, sigdecode_string 
-
 from geoalchemy2.elements import WKTElement
 
-# Local imports
+# --- LOCAL MODULES ---
 from src.database import get_db, engine
 import src.models as models
 import src.schemas as schemas
 
 # ==========================================
-# DATABASE INITIALIZATION & WAITER
+# INFRASTRUCTURE INITIALIZATION
 # ==========================================
 
 def wait_for_db(retries=10, delay=3):
     """
-    Blocks startup until the Database is ready to accept connections.
+    Blocks startup until the PostgreSQL database is ready.
+    Crucial for container orchestration to prevent race conditions.
     """
     print("Checking Database connection...")
     for i in range(retries):
@@ -46,76 +49,140 @@ def wait_for_db(retries=10, delay=3):
             print("✅ Database is up and running!")
             return
         except OperationalError:
-            print(f"⏳ Database not ready yet... waiting {delay}s ({i+1}/{retries})")
+            print(f"⏳ Waiting for DB... ({i+1}/{retries})")
             time.sleep(delay)
-    
-    raise Exception("❌ Could not connect to Database after multiple retries.")
+    raise Exception("❌ DB Connection Failed after multiple retries.")
 
-# 1. Wait for DB
+# 1. Initialize Database
 wait_for_db()
-
-# 2. Create Tables
 models.Base.metadata.create_all(bind=engine)
 
+# 2. Initialize FastAPI
+app = FastAPI(title="QuakeGuard Backend", version="2.2.0")
 
-# Initialize FastAPI
-app = FastAPI(
-    title="Q Backend Service",
-    description="Core API for Earthquake Alarm System: Ingestion, Alerts, and Statistics.",
-    version="1.7.0"
-)
-
-# Initialize Redis
+# 3. Initialize Redis Client (Async)
 redis_client = aioredis.from_url("redis://redis:6379/0", decode_responses=True)
 
 
-# --- UTILITY FUNCTIONS ---
+# ==========================================
+# REAL-TIME NOTIFICATION SYSTEM (PUBSUB)
+# ==========================================
+
+class ConnectionManager:
+    """
+    Manages active WebSocket connections for broadcasting alerts.
+    """
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        """Accepts a new connection and adds it to the pool."""
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        # print(f"🔌 Client Connected. Active: {len(self.active_connections)}")
+
+    def disconnect(self, websocket: WebSocket):
+        """Removes a connection from the pool."""
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: str):
+        """
+        Pushes a message to all connected clients.
+        Handles stale connections gracefully.
+        """
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except Exception:
+                # If sending fails, assume client disconnected abruptly
+                pass
+
+manager = ConnectionManager()
+
+async def redis_alert_listener():
+    """
+    Background Task:
+    Subscribes to the Redis 'quake_alerts' channel.
+    When the Worker publishes a critical alert, this listener receives it
+    and triggers a WebSocket broadcast.
+    """
+    pubsub = redis_client.pubsub()
+    await pubsub.subscribe("quake_alerts")
+    print("🎧 Redis Pub/Sub Listener active on channel: 'quake_alerts'")
+
+    async for message in pubsub.listen():
+        if message["type"] == "message":
+            alert_payload = message["data"]
+            # print(f"⚡ Broadcasting Alert: {alert_payload}")
+            await manager.broadcast(alert_payload)
+
+@app.on_event("startup")
+async def startup_event():
+    """Starts the Redis Listener task when the API boots up."""
+    asyncio.create_task(redis_alert_listener())
+
+@app.websocket("/ws/alerts")
+async def websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket Endpoint:
+    Clients (Mobile Apps/Dashboards) connect here to receive real-time updates.
+    """
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Keep the connection alive. 
+            # We assume clients listen only, but we must await receive.
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception:
+        manager.disconnect(websocket)
+
+
+# ==========================================
+# UTILITY: CRYPTO VERIFICATION
+# ==========================================
 
 def verify_device_signature(public_key_hex: str, message: str, signature_hex: str) -> bool:
     """
-    Verifies ECDSA signature using SHA256 hashing.
-    Compatible with ESP32 MbedTLS (DER) and Standard Python (RAW).
+    Verifies ECDSA signature (NIST256p + SHA256).
+    Supports DER (MbedTLS) and RAW formats.
     """
     try:
-        if not public_key_hex or not signature_hex:
-            return False
-            
+        if not public_key_hex or not signature_hex: return False
         key_bytes = bytes.fromhex(public_key_hex)
         sig_bytes = bytes.fromhex(signature_hex)
         message_bytes = message.encode('utf-8')
 
-        # 1. Load the Key (Try DER first - ESP32 Standard, fallback to RAW)
+        # Attempt DER decoding (Standard)
         try:
             vk = VerifyingKey.from_der(key_bytes)
-        except (ValueError, MalformedPointError):
+        except:
+            # Fallback to RAW
             vk = VerifyingKey.from_string(key_bytes, curve=NIST256p)
         
-        # 2. Verify with SHA256 (CRITICAL: Matches ESP32's mbedtls_md_info_from_type(SHA256))
+        # Verify Signature
         try:
-            # Try DER (ASN.1) first
             return vk.verify(sig_bytes, message_bytes, sigdecode=sigdecode_der, hashfunc=hashlib.sha256)
-        except BadSignatureError:
-            # Fallback to RAW string signature
+        except:
             try:
                 return vk.verify(sig_bytes, message_bytes, sigdecode=sigdecode_string, hashfunc=hashlib.sha256)
-            except BadSignatureError:
+            except:
                 return False
-
-    except Exception as e:
-        print(f"⚠️ Crypto Validation Error: {str(e)}")
+    except:
         return False
 
 
 # ==========================================
-# REGISTRATION ENDPOINTS
+# REST API ENDPOINTS
 # ==========================================
 
-@app.post("/zones/", response_model=schemas.Zone, status_code=status.HTTP_201_CREATED, tags=["Registration"])
+@app.post("/zones/", response_model=schemas.Zone, status_code=201, tags=["Registration"])
 def create_zone(zone: schemas.ZoneCreate, db: Session = Depends(get_db)):
-    """Registers a new geographical zone."""
+    """Registers a new zone."""
     existing = db.query(models.Zone).filter(models.Zone.city == zone.city).first()
-    if existing:
-        return existing 
+    if existing: return existing 
     db_zone = models.Zone(city=zone.city)
     db.add(db_zone)
     db.commit()
@@ -124,135 +191,83 @@ def create_zone(zone: schemas.ZoneCreate, db: Session = Depends(get_db)):
 
 @app.get("/zones/", response_model=List[schemas.Zone], tags=["Data Retrieval"])
 def get_zones(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    """
-    List all available geographical zones.
-    Useful for frontend dropdowns or sensor configuration.
-    """
+    """Lists available zones."""
     return db.query(models.Zone).offset(skip).limit(limit).all()
 
-
-@app.post("/misurators/", response_model=schemas.Misurator, status_code=status.HTTP_201_CREATED, tags=["Registration"])
+@app.post("/misurators/", response_model=schemas.Misurator, status_code=201, tags=["Registration"])
 def create_misurator(misurator: schemas.MisuratorCreate, db: Session = Depends(get_db)):
-    """Registers a new IoT Sensor and its Public Key."""
-    # Check if key needs update (for Dev convenience)
-    # Note: In prod, you might query by public_key or hardware_id, here we simplify.
+    """Registers an IoT Sensor with its Public Key."""
     existing = db.query(models.Misurator).filter(models.Misurator.public_key_hex == misurator.public_key_hex).first()
-    if existing:
-        return existing
+    if existing: return existing
 
     zone = db.query(models.Zone).filter(models.Zone.id == misurator.zone_id).first()
-    if zone is None:
-        raise HTTPException(status_code=404, detail="Zone not found")
+    if not zone: raise HTTPException(404, detail="Zone not found")
     
     gps_point = f"POINT({misurator.longitude} {misurator.latitude})"
-    
     db_misurator = models.Misurator(
-        active=misurator.active,
-        zone_id=misurator.zone_id,
-        latitude=misurator.latitude,
-        longitude=misurator.longitude,
-        location=WKTElement(gps_point, srid=4326),
-        public_key_hex=misurator.public_key_hex
+        active=misurator.active, zone_id=misurator.zone_id,
+        latitude=misurator.latitude, longitude=misurator.longitude,
+        location=WKTElement(gps_point, srid=4326), public_key_hex=misurator.public_key_hex
     )
-    
     db.add(db_misurator)
     db.commit()
     db.refresh(db_misurator)
     return db_misurator
 
-
 @app.get("/misurators/", response_model=List[schemas.Misurator], tags=["Data Retrieval"])
 def get_misurators(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    """List all registered sensors."""
+    """Lists registered sensors."""
     return db.query(models.Misurator).offset(skip).limit(limit).all()
 
-
-# ==========================================
-# INGESTION ENDPOINT
-# ==========================================
-
-@app.post("/misurations/", status_code=status.HTTP_202_ACCEPTED, tags=["Ingestion"])
-async def create_misuration_async(
-    misuration: schemas.MisurationCreate, 
-    db: Session = Depends(get_db)
-):
+@app.post("/misurations/", status_code=202, tags=["Ingestion"])
+async def create_misuration_async(misuration: schemas.MisurationCreate, db: Session = Depends(get_db)):
     """
-    Receives data, verifies signature (SHA256), and queues to Redis.
+    High-Frequency Ingestion.
+    Validates Signature + Replay Attack (60s window) -> Pushes to Redis Queue.
     """
     misurator = db.query(models.Misurator).filter(models.Misurator.id == misuration.misurator_id).first()
-    
-    if not misurator or not misurator.active:
-        raise HTTPException(status_code=403, detail="Sensor unauthorized or inactive")
+    if not misurator or not misurator.active: raise HTTPException(403, detail="Sensor unauthorized")
 
-    # CRITICAL: Reconstruct message as "value:int(timestamp)" to match ESP32
+    # 1. Reconstruct Message
     message = f"{misuration.value}:{int(misuration.device_timestamp)}"
     
+    # 2. Verify Signature (CPU-bound offload)
     loop = asyncio.get_event_loop()
-    is_valid = await loop.run_in_executor(
-        None, 
-        verify_device_signature, 
-        misurator.public_key_hex, 
-        message, 
-        misuration.signature_hex
-    )
+    is_valid = await loop.run_in_executor(None, verify_device_signature, misurator.public_key_hex, message, misuration.signature_hex)
 
-    if not is_valid:
-        print(f"\n❌ SIGNATURE FAILED for Sensor {misurator.id}")
-        print(f"Expected Message: {message}")
-        print(f"Stored Key: {misurator.public_key_hex[:15]}...")
-        print(f"Received Sig: {misuration.signature_hex[:15]}...\n")
-        raise HTTPException(status_code=401, detail="Invalid digital signature")
+    if not is_valid: raise HTTPException(401, detail="Invalid digital signature")
 
-    # Prepare payload for Worker
+    # 3. Check Replay Attack (Timestamp Validity)
+    server_now = time.time()
+    device_ts = misuration.device_timestamp
+    if abs(server_now - device_ts) > 60:
+         raise HTTPException(403, detail="Replay Attack Detected: Timestamp invalid")
+
+    # 4. Enqueue for Worker
     payload = misuration.model_dump()
     payload['zone_id'] = misurator.zone_id 
-    
     await redis_client.lpush("seismic_events", json.dumps(payload))
     
-    return {"status": "accepted", "detail": "Data enqueued"}
-
-
-# ==========================================
-# STATISTICS & ALERTS ENDPOINTS (RESTORED)
-# ==========================================
+    return {"status": "accepted"}
 
 @app.get("/zones/{zone_id}/alerts", response_model=List[schemas.AlertResponse], tags=["Data Retrieval"])
-def get_zone_alerts(
-    zone_id: int, 
-    limit: int = 10, 
-    db: Session = Depends(get_db)
-):
-    """
-    Retrieves recent seismic alerts for a specific zone.
-    """
-    alerts = db.query(models.Alert)\
-        .filter(models.Alert.zone_id == zone_id)\
-        .order_by(desc(models.Alert.timestamp))\
-        .limit(limit)\
-        .all()
-        
-    return alerts if alerts else []
-
+def get_zone_alerts(zone_id: int, limit: int = 10, db: Session = Depends(get_db)):
+    """Fetches persistent alerts from DB."""
+    return db.query(models.Alert).filter(models.Alert.zone_id == zone_id).order_by(desc(models.Alert.timestamp)).limit(limit).all()
 
 @app.get("/sensors/{misurator_id}/statistics", tags=["Analytics"])
-def get_sensor_statistics(
-    misurator_id: int, 
-    db: Session = Depends(get_db)
-):
-    """
-    Computes statistical aggregates (AVG, MAX, MIN, COUNT) for a sensor.
-    """
+def get_sensor_statistics(misurator_id: int, db: Session = Depends(get_db)):
+    """Calculates real-time sensor statistics."""
     sensor = db.query(models.Misurator).filter(models.Misurator.id == misurator_id).first()
-    if not sensor:
-        raise HTTPException(status_code=404, detail="Sensor not found")
-
+    if not sensor: raise HTTPException(404, detail="Sensor not found")
+    
     stats = db.query(
         func.count(models.Misuration.id).label("count"),
         func.avg(models.Misuration.value).label("average"),
         func.max(models.Misuration.value).label("max_value"),
         func.min(models.Misuration.value).label("min_value")
     ).filter(models.Misuration.misurator_id == misurator_id).first()
-
+    
     return {
         "misurator_id": misurator_id,
         "total_readings": stats.count,
@@ -262,42 +277,7 @@ def get_sensor_statistics(
         "generated_at": datetime.utcnow().isoformat()
     }
 
-
-# ==========================================
-# SYSTEM HEALTH 
-# ==========================================
-
 @app.get("/health", tags=["System"])
 async def health_check(db: Session = Depends(get_db)):
-    """
-    Checks connection status for Database and Redis.
-    """
-    health_status: Dict[str, Any] = {
-        "status": "ok",
-        "timestamp": datetime.utcnow().isoformat(),
-        "services": {
-            "database": "unknown",
-            "redis": "unknown"
-        }
-    }
-
-    # 1. Check DB
-    try:
-        db.execute(func.now()) 
-        health_status["services"]["database"] = "connected"
-    except Exception as e:
-        health_status["status"] = "degraded"
-        health_status["services"]["database"] = f"error: {str(e)}"
-
-    # 2. Check Redis
-    try:
-        await redis_client.ping()
-        health_status["services"]["redis"] = "connected"
-    except Exception as e:
-        health_status["status"] = "degraded"
-        health_status["services"]["redis"] = f"error: {str(e)}"
-
-    if health_status["status"] != "ok":
-        raise HTTPException(status_code=503, detail=health_status)
-
-    return health_status
+    """Liveness probe."""
+    return {"status": "ok"}
