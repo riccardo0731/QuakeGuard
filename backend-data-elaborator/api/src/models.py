@@ -1,9 +1,8 @@
 """
 Database Models Definition
 --------------------------
-This module defines the SQLAlchemy ORM models for the Earthquake Monitoring System.
-It integrates PostGIS geometry types for GPS location handling and defines
-the schema for Zones, Sensors (Misurators), Measurements, and Alerts.
+Defines the SQLAlchemy ORM models.
+Updated to support Device Provisioning (MAC Address & Firmware Version).
 """
 
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Float
@@ -13,10 +12,6 @@ from geoalchemy2 import Geometry
 from src.database import Base
 
 class Zone(Base):
-    """
-    Represents a geographical zone (e.g., a city or district).
-    Acts as the parent entity for sensors and alerts.
-    """
     __tablename__ = "zones"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -28,8 +23,8 @@ class Zone(Base):
 
 class Misurator(Base):
     """
-    Represents a physical IoT sensor device installed in a specific Zone.
-    Includes GPS coordinates managed via PostGIS.
+    IoT Sensor Device.
+    Includes Security (ECDSA Key) and Hardware Identity (MAC, Firmware).
     """
     __tablename__ = "misurators"
 
@@ -44,9 +39,13 @@ class Misurator(Base):
     longitude = Column(Float, nullable=True)
     location = Column(Geometry('POINT', srid=4326), nullable=True)
 
-    # --- SECURITY (Ecco il pezzo mancante!) ---
-    # Stores the ECDSA Public Key used to verify message signatures
-    public_key_hex = Column(String, nullable=False)
+    # --- SECURITY & IDENTITY ---
+    # La chiave pubblica è l'identità crittografica primaria
+    public_key_hex = Column(String, nullable=False, unique=True, index=True)
+    
+    # [FIX CRITICO] Identificativi Hardware per il Provisioning
+    mac_address = Column(String(17), nullable=True, unique=True, index=True)
+    firmware_version = Column(String(20), nullable=True)
 
     # Relationships
     zone = relationship("Zone", back_populates="misurators")
@@ -54,26 +53,18 @@ class Misurator(Base):
 
 
 class Misuration(Base):
-    """
-    Represents a single data point (acceleration/vibration) recorded by a Misurator.
-    """
     __tablename__ = "misurations"
 
     id = Column(Integer, primary_key=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
     value = Column(Integer, nullable=False)
     
-    # Foreign Key
     misurator_id = Column(Integer, ForeignKey("misurators.id"), nullable=False)
 
-    # Relationships
     misurator = relationship("Misurator", back_populates="misurations")
 
 
 class Alert(Base):
-    """
-    Represents an aggregated/confirmed seismic event for a specific zone.
-    """
     __tablename__ = "alerts"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -82,5 +73,4 @@ class Alert(Base):
     severity = Column(Float, nullable=False) 
     message = Column(String(255), nullable=True)
 
-    # Relationships
     zone = relationship("Zone")
