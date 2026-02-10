@@ -1,5 +1,5 @@
-import { ShieldAlert, ShieldCheck } from "lucide-react-native";
-import React, { useEffect } from "react";
+import { ShieldAlert, ShieldCheck, Wifi, WifiOff } from "lucide-react-native";
+import React, { useEffect, useRef, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import Animated, {
   Easing,
@@ -9,25 +9,61 @@ import Animated, {
   withSequence,
   withTiming,
 } from "react-native-reanimated";
-import { useQuakeStore } from "../../store/quakeStore";
+import { useWebSocket } from "../../context/WebSocketContext";
 
+/**
+ * MonitorScreen Component.
+ * Displays the real-time status of the seismic system.
+ * Uses local timers to manage alert duration, independent of device system time.
+ */
 export default function MonitorScreen() {
-  const { systemStatus, startMonitoring, stopMonitoring } = useQuakeStore();
+  const { isConnected, lastAlert } = useWebSocket();
 
-  // Shared value for the pulse animation
+  // Local state to manage the visual alert status
+  const [isAlertActive, setIsAlertActive] = useState(false);
+
+  // Animation shared value
   const pulse = useSharedValue(1);
 
-  // Lifecycle management for polling
-  useEffect(() => {
-    startMonitoring();
-    return () => {
-      stopMonitoring();
-    };
-  }, []);
+  // Timer reference to handle cleanup and debounce
+  const alertTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Animation logic triggered by status change
+  /**
+   * Effect: Handle incoming alerts.
+   * Triggered whenever `lastAlert` changes via WebSocket.
+   * Sets local state to active and starts a 60-second countdown.
+   */
   useEffect(() => {
-    if (systemStatus === "ALERT") {
+    if (lastAlert) {
+      console.log("[Monitor] New alert received. Activating UI.");
+      setIsAlertActive(true);
+
+      // Clear existing timer if a new alert arrives (extend duration)
+      if (alertTimerRef.current) {
+        clearTimeout(alertTimerRef.current);
+      }
+
+      // Set a local timer to dismiss the alert after 60 seconds
+      alertTimerRef.current = setTimeout(() => {
+        console.log("[Monitor] Alert timeout reached. Resetting UI.");
+        setIsAlertActive(false);
+      }, 60000);
+    }
+
+    // Cleanup on unmount
+    return () => {
+      if (alertTimerRef.current) {
+        clearTimeout(alertTimerRef.current);
+      }
+    };
+  }, [lastAlert]);
+
+  /**
+   * Effect: Handle Pulse Animation.
+   * synchronized with `isAlertActive` state.
+   */
+  useEffect(() => {
+    if (isAlertActive) {
       pulse.value = withRepeat(
         withSequence(
           withTiming(1.2, { duration: 300, easing: Easing.inOut(Easing.ease) }),
@@ -37,43 +73,73 @@ export default function MonitorScreen() {
         true, // Reverse
       );
     } else {
-      pulse.value = withTiming(1, { duration: 300 }); // Reset to default scale
+      // Reset animation smoothly
+      pulse.value = withTiming(1, { duration: 300 });
     }
-  }, [systemStatus]);
+  }, [isAlertActive]);
 
   const animatedStyle = useAnimatedStyle(() => ({
     transform: [{ scale: pulse.value }],
-    opacity: systemStatus === "ALERT" ? pulse.value : 1, // Slight opacity effect during pulse
+    opacity: isAlertActive ? pulse.value : 1,
   }));
 
-  const isSecure = systemStatus === "SECURE";
+  // Helper to determine background color
+  const backgroundColor = isAlertActive ? "#fef2f2" : "#f0fdf4";
+  const textColor = isAlertActive ? "#991b1b" : "#166534";
 
   return (
-    <View
-      style={[
-        styles.container,
-        { backgroundColor: isSecure ? "#f0fdf4" : "#fef2f2" },
-      ]}
-    >
-      <Animated.View style={[styles.iconContainer, animatedStyle]}>
-        {isSecure ? (
-          <ShieldCheck size={120} color="#16a34a" />
+    <View style={[styles.container, { backgroundColor }]}>
+      {/* Connection Status Indicator */}
+      <View style={styles.connectionBadge}>
+        {isConnected ? (
+          <Wifi size={20} color="#16a34a" />
         ) : (
+          <WifiOff size={20} color="#dc2626" />
+        )}
+        <Text
+          style={[
+            styles.connectionText,
+            { color: isConnected ? "#16a34a" : "#dc2626" },
+          ]}
+        >
+          {isConnected ? "LIVE" : "OFFLINE"}
+        </Text>
+      </View>
+
+      {/* Main Visual Indicator */}
+      <Animated.View style={[styles.iconContainer, animatedStyle]}>
+        {isAlertActive ? (
           <ShieldAlert size={120} color="#dc2626" />
+        ) : (
+          <ShieldCheck size={120} color="#16a34a" />
         )}
       </Animated.View>
 
-      <Text
-        style={[styles.statusText, { color: isSecure ? "#166534" : "#991b1b" }]}
-      >
-        {isSecure ? "SYSTEM SECURE" : "⚠️ SEISMIC ALERT ⚠️"}
+      {/* Status Text */}
+      <Text style={[styles.statusText, { color: textColor }]}>
+        {isAlertActive ? "⚠️ SEISMIC ALERT ⚠️" : "SYSTEM SECURE"}
       </Text>
 
-      <Text style={styles.subText}>
-        {isSecure
-          ? "No recent seismic activity detected."
-          : "Critical seismic activity detected in Zone 1."}
-      </Text>
+      {/* Alert Details or Idle Message */}
+      {isAlertActive && lastAlert ? (
+        <View style={styles.alertDetails}>
+          <View style={styles.alertRow}>
+            <Text style={styles.alertLabel}>ZONE:</Text>
+            <Text style={styles.alertValue}>{lastAlert.zone_id}</Text>
+          </View>
+          <View style={styles.alertRow}>
+            <Text style={styles.alertLabel}>MAGNITUDE:</Text>
+            <Text style={styles.alertValue}>
+              {lastAlert.magnitude.toFixed(1)}
+            </Text>
+          </View>
+          <Text style={styles.alertMessage}>"{lastAlert.message}"</Text>
+        </View>
+      ) : (
+        <Text style={styles.subText}>
+          Network active. Monitoring sensors...
+        </Text>
+      )}
     </View>
   );
 }
@@ -85,29 +151,76 @@ const styles = StyleSheet.create({
     alignItems: "center",
     padding: 20,
   },
+  connectionBadge: {
+    position: "absolute",
+    top: 60, // Adjusted for SafeArea
+    right: 20,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: "rgba(255,255,255,0.8)",
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 12,
+  },
+  connectionText: {
+    fontSize: 12,
+    fontWeight: "800",
+    letterSpacing: 0.5,
+  },
   iconContainer: {
     marginBottom: 40,
     shadowColor: "#000",
-    shadowOffset: {
-      width: 0,
-      height: 4,
-    },
+    shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.1,
-    shadowRadius: 5.46,
-    elevation: 9,
+    shadowRadius: 10,
+    elevation: 5,
   },
   statusText: {
     fontSize: 28,
-    fontWeight: "800",
-    marginBottom: 12,
+    fontWeight: "900",
+    marginBottom: 10,
     textAlign: "center",
-    letterSpacing: 0.5,
+    letterSpacing: 1,
   },
   subText: {
     fontSize: 16,
-    color: "#4b5563",
+    color: "#6b7280",
     textAlign: "center",
-    maxWidth: "80%",
-    lineHeight: 24,
+    marginTop: 10,
+  },
+  alertDetails: {
+    marginTop: 30,
+    width: "100%",
+    padding: 20,
+    backgroundColor: "#fee2e2",
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#fecaca",
+  },
+  alertRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginBottom: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: "rgba(0,0,0,0.05)",
+    paddingBottom: 4,
+  },
+  alertLabel: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#7f1d1d",
+  },
+  alertValue: {
+    fontSize: 18,
+    fontWeight: "800",
+    color: "#b91c1c",
+  },
+  alertMessage: {
+    fontSize: 16,
+    fontStyle: "italic",
+    marginTop: 10,
+    textAlign: "center",
+    color: "#991b1b",
   },
 });
