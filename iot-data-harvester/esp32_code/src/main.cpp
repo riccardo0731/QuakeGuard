@@ -1,14 +1,13 @@
 /**
  * Project: QuakeGuard - Professional Seismic Node
- * Version: 3.1.0-PRO
+ * Version: 3.2.0-PROV (Provisioning Edition)
  * Target Hardware: ESP32-C3 SuperMini + ADXL345
  * Author: GiZano
  *
- * CHANGELOG v3.1.0:
- * - CRITICAL: I2C Clock increased to 100kHz (Standard Mode) for timing compliance.
- * - FEATURE: Integrated WiFiManager (No more hardcoded credentials).
- * - STABILITY: Added 2000ms timeout to HTTP Client to prevent task blocking.
- * - SYSTEM: Config Portal timeout set to 180s to allow offline sensor operation.
+ * CHANGELOG v3.2.0:
+ * - FEATURE: Automated Device Handshake (Provisioning).
+ * - LOGIC: Removed hardcoded SENSOR_ID. ID is now retrieved from Server and stored in NVS.
+ * - SECURITY: Added 'ENROLLMENT_TOKEN' for secure registration.
  */
 
 #include <Arduino.h>
@@ -16,7 +15,8 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_ADXL345_U.h>
 #include <WiFi.h>
-#include <WiFiManager.h> // Requires "tzapu/WiFiManager" library
+#include <WiFiManager.h>
+#include <HTTPClient.h> // Required for Provisioning POST request
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <time.h>
@@ -33,21 +33,14 @@
 // --------------------------------------------------------------------------
 #define I2C_SDA_PIN 7
 #define I2C_SCL_PIN 8
-
-// I2C Frequency: 100kHz (Standard Mode)
-// 10kHz was insufficient for 100Hz sampling rate loop times.
 #define I2C_CLOCK_SPEED 100000 
 
 // Global Sensor Pointer
-// Dynamic allocation is strictly required here to delay constructor execution
-// until AFTER Wire.setPins(7,8) is called.
 Adafruit_ADXL345_Unified *accel = NULL;
 
 // --------------------------------------------------------------------------
-// SERVER CONFIGURATION
+// SERVER & ENROLLMENT CONFIGURATION
 // --------------------------------------------------------------------------
-// WiFi Credentials are now handled by WiFiManager and stored in NVS.
-
 #ifndef SERVER_HOST
   #define SERVER_HOST "192.168.1.50"
 #endif
@@ -57,14 +50,20 @@ Adafruit_ADXL345_Unified *accel = NULL;
 #ifndef SERVER_PATH
   #define SERVER_PATH "/measurements/"
 #endif
-#ifndef SENSOR_ID
-  #define SENSOR_ID 101
+#ifndef SERVER_REGISTER_PATH
+  #define SERVER_REGISTER_PATH "/devices/register"
 #endif
 
-const char* SERVER_HOST_CONF   = SERVER_HOST;
-const int   SERVER_PORT_CONF   = SERVER_PORT;
-const char* SERVER_PATH_CONF   = SERVER_PATH;
-const int   SENSOR_ID_CONF     = SENSOR_ID;
+// SECRET TOKEN FOR REGISTRATION (Must match backend)
+#define ENROLLMENT_TOKEN "S3cret_Qu4k3_K3y" 
+
+const char* SERVER_HOST_CONF     = SERVER_HOST;
+const int   SERVER_PORT_CONF     = SERVER_PORT;
+const char* SERVER_PATH_CONF     = SERVER_PATH;
+const char* SERVER_REG_PATH_CONF = SERVER_REGISTER_PATH;
+
+// GLOBAL DYNAMIC SENSOR ID (Default 0 = Unregistered)
+int globalSensorID = 0;
 
 // --------------------------------------------------------------------------
 // RTOS HANDLES & STRUCTURES
@@ -115,17 +114,25 @@ void initCrypto() {
         preferences.getBytes("priv_key", buf, len);
         mbedtls_pk_parse_key(&pk_context, buf, len, NULL, 0);
     }
+}
 
-    // Export Public Key
+/**
+ * @brief Extracts the Public Key as a Hex String for JSON transmission.
+ */
+String getPublicKeyHex() {
     unsigned char pub_buf[128];
-    int ret_pub = mbedtls_pk_write_pubkey_der(&pk_context, pub_buf, sizeof(pub_buf));
-    int pub_len = ret_pub;
+    int ret = mbedtls_pk_write_pubkey_der(&pk_context, pub_buf, sizeof(pub_buf));
+    // mbedtls writes at the END of the buffer
+    int len = ret;
+    int start_index = sizeof(pub_buf) - len;
 
-    Serial.print("[SEC] DEVICE PUBLIC KEY (HEX): ");
-    for(int i = sizeof(pub_buf) - pub_len; i < sizeof(pub_buf); i++) {
-        Serial.printf("%02x", pub_buf[i]);
+    String hexKey = "";
+    for(int i = start_index; i < sizeof(pub_buf); i++) {
+        char buf[3];
+        sprintf(buf, "%02x", pub_buf[i]);
+        hexKey += buf;
     }
-    Serial.println();
+    return hexKey;
 }
 
 String signMessage(String message) {
@@ -146,13 +153,75 @@ String signMessage(String message) {
 }
 
 // --------------------------------------------------------------------------
-// TASK: SENSOR (OPTIMIZED)
+// PROVISIONING LOGIC (NEW)
+// --------------------------------------------------------------------------
+bool performProvisioning() {
+    Serial.println("\n[PROV] Starting Device Handshake...");
+    
+    if(WiFi.status() != WL_CONNECTED) {
+        Serial.println("[PROV] Error: No WiFi connection.");
+        return false;
+    }
+
+    HTTPClient http;
+    String url = String("http://") + SERVER_HOST_CONF + ":" + SERVER_PORT_CONF + SERVER_REG_PATH_CONF;
+    
+    Serial.printf("[PROV] Connecting to: %s\n", url.c_str());
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+
+    // Construct Payload
+    JsonDocument doc;
+    doc["public_key_hex"] = getPublicKeyHex();
+    doc["mac_address"] = WiFi.macAddress();
+    doc["enrollment_token"] = ENROLLMENT_TOKEN;
+    
+    String requestBody;
+    serializeJson(doc, requestBody);
+
+    // Execute POST
+    int httpResponseCode = http.POST(requestBody);
+
+    if (httpResponseCode == 200 || httpResponseCode == 201) {
+        String response = http.getString();
+        JsonDocument resDoc;
+        deserializeJson(resDoc, response);
+        
+        int newID = resDoc["sensor_id"];
+        if (newID > 0) {
+            // Save to NVS
+            preferences.begin("quake-config", false);
+            preferences.putInt("sensor_id", newID);
+            preferences.end();
+            
+            globalSensorID = newID;
+            Serial.printf("[PROV] SUCCESS! Assigned Sensor ID: %d\n", globalSensorID);
+            http.end();
+            return true;
+        } else {
+            Serial.println("[PROV] Error: Server returned invalid ID.");
+        }
+    } else {
+        Serial.printf("[PROV] Registration Failed. HTTP Code: %d\n", httpResponseCode);
+        Serial.println("[PROV] Server Response: " + http.getString());
+    }
+    
+    http.end();
+    return false;
+}
+
+// --------------------------------------------------------------------------
+// TASK: SENSOR
 // --------------------------------------------------------------------------
 void sensorTask(void *pvParameters) {
     float lta = 0.0f, sta = 0.0f, prev_raw_mag = 9.81f, filtered_mag = 0.0f;
     sensors_event_t event;
     
     while (accel == NULL) vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Wait until we have a valid ID before monitoring? 
+    // Technically we can monitor, but we can't send valid data without ID.
+    // We proceed, but the Network Task will handle the ID check.
 
     Serial.println("[SENSOR] Task Active. Stabilizing...");
     for(int i=0; i<20; i++) { 
@@ -171,22 +240,18 @@ void sensorTask(void *pvParameters) {
 
     for(;;) {
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
-        
         if (!accel->getEvent(&event)) continue; 
 
         float raw_mag = sqrt(pow(event.acceleration.x, 2) + pow(event.acceleration.y, 2) + pow(event.acceleration.z, 2));
 
-        // Dropout Protection (< 0.2G)
-        if (raw_mag < 2.0f) continue; 
+        if (raw_mag < 2.0f) continue; // Dropout protection
         
         filtered_mag = 0.9f * (filtered_mag + raw_mag - prev_raw_mag);
         prev_raw_mag = raw_mag;
         float abs_signal = abs(filtered_mag);
 
-        // Noise Gate
         if (abs_signal < NOISE_FLOOR) abs_signal = 0.0f;
 
-        // STA/LTA
         lta = (ALPHA_LTA * abs_signal) + ((1.0f - ALPHA_LTA) * lta);
         sta = (ALPHA_STA * abs_signal) + ((1.0f - ALPHA_STA) * sta);
         
@@ -204,37 +269,34 @@ void sensorTask(void *pvParameters) {
 }
 
 // --------------------------------------------------------------------------
-// TASK: NETWORK (WITH WATCHDOG & TIMEOUT)
+// TASK: NETWORK
 // --------------------------------------------------------------------------
 void networkTask(void *pvParameters) {
     WiFiClient client;
-    
-    // Explicit Timeout to prevent hanging on unresponsive servers
     client.setTimeout(2000); 
 
-    // Wait for WiFiManager to handle initial connection in setup
-    // or connecting via saved credentials
+    // Wait for WiFi
     while (WiFi.status() != WL_CONNECTED) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
     SeismicEvent receivedEvt;
     for(;;) {
         if (xQueueReceive(eventQueue, &receivedEvt, portMAX_DELAY) == pdTRUE) {
             
-            // Connection Watchdog
+            // Check if we have a valid ID. If not, we cannot report.
+            if (globalSensorID == 0) {
+                Serial.println("[NET] Warning: Seismic Event detected but Device is not Registered!");
+                // Optionally try provisioning again here?
+                continue;
+            }
+
             if (WiFi.status() != WL_CONNECTED) { 
-                Serial.println("[NET] WiFi Lost. Attempting Reconnect...");
+                Serial.println("[NET] Reconnecting WiFi...");
                 WiFi.reconnect();
-                // Give it some time to reconnect
-                int retry = 0;
-                while(WiFi.status() != WL_CONNECTED && retry < 5) {
-                    vTaskDelay(pdMS_TO_TICKS(1000));
-                    retry++;
-                }
-                if(WiFi.status() != WL_CONNECTED) continue; // Skip this event if no net
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                if(WiFi.status() != WL_CONNECTED) continue; 
             }
             
             time_t now_unix; time(&now_unix);
@@ -247,22 +309,20 @@ void networkTask(void *pvParameters) {
 
             JsonDocument doc;
             doc["value"] = val; 
-            doc["misurator_id"] = SENSOR_ID_CONF;
+            doc["misurator_id"] = globalSensorID; // USE DYNAMIC ID
             doc["device_timestamp"] = evt_time; 
             doc["signature_hex"] = sig;
             String json; serializeJson(doc, json);
 
-            Serial.println("[NET] Sending...");
+            Serial.println("[NET] Sending Event...");
             if (client.connect(SERVER_HOST_CONF, SERVER_PORT_CONF)) {
                 client.println(String("POST ") + SERVER_PATH_CONF + " HTTP/1.1");
                 client.println(String("Host: ") + SERVER_HOST_CONF);
                 client.println("Content-Type: application/json");
                 client.print("Content-Length: "); client.println(json.length());
-                client.println("Connection: close"); 
-                client.println();
+                client.println("Connection: close"); client.println();
                 client.println(json);
                 
-                // Read response with timeout protection
                 while(client.connected() || client.available()) { 
                     if(client.available()) client.readStringUntil('\n'); 
                 }
@@ -276,39 +336,53 @@ void networkTask(void *pvParameters) {
 }
 
 // --------------------------------------------------------------------------
-// SETUP (WIFIMANAGER + HARDWARE INIT)
+// SETUP
 // --------------------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
     while(!Serial) delay(10); 
     delay(2000); 
 
-    Serial.println("\n\n[BOOT] QuakeGuard v3.1 PRO");
+    Serial.println("\n\n[BOOT] QuakeGuard v3.2 PROV");
     
-    // 1. CRYPTO INIT
+    // 1. CRYPTO INIT (Keys needed for provisioning)
     initCrypto();
     
-    Serial.println("\n--- 10 SECONDS TO COPY PUBLIC KEY ---");
-    for(int i=10; i>0; i--) { Serial.printf(" %d...", i); delay(1000); }
-    Serial.println("\n");
+    // 2. CHECK NVS FOR ID
+    preferences.begin("quake-config", false); // Namespace for config
+    globalSensorID = preferences.getInt("sensor_id", 0);
+    preferences.end();
 
-    // 2. WIFIMANAGER (BLOCKING PORTAL)
-    // Create Config Portal "QuakeGuard-Setup". 
-    // If no saved creds, user must connect to this AP and configure WiFi.
+    if (globalSensorID > 0) {
+        Serial.printf("[BOOT] Device Registered. ID: %d\n", globalSensorID);
+    } else {
+        Serial.println("[BOOT] Device UNREGISTERED. Entering Provisioning Mode...");
+    }
+
+    // 3. WIFIMANAGER (Connect to Network)
     WiFiManager wm;
-    wm.setConfigPortalTimeout(180); // 3 minutes timeout, then boot anyway (offline mode)
+    wm.setConfigPortalTimeout(180); 
     
     Serial.println("[NET] Initializing WiFiManager...");
     if (!wm.autoConnect("QuakeGuard-Setup")) {
-        Serial.println("[NET] Failed to connect or timeout. Booting in Offline Mode.");
+        Serial.println("[NET] WiFi Failed. Offline Mode.");
     } else {
-        Serial.println("[NET] WiFi Connected via WiFiManager.");
+        Serial.println("[NET] WiFi Connected.");
+        
+        // 4. PROVISIONING (Only if not registered)
+        if (globalSensorID == 0) {
+            bool success = performProvisioning();
+            if (!success) {
+                Serial.println("[FATAL] Provisioning Failed. Retrying on next boot.");
+                // We can choose to halt or continue monitoring locally.
+                // Continuing allows diagnostics via Serial.
+            }
+        }
     }
 
-    // 3. HARDWARE INIT
+    // 5. HARDWARE INIT
     Serial.printf("[HARDWARE] I2C Init: SDA=%d, SCL=%d @ %dHz\n", I2C_SDA_PIN, I2C_SCL_PIN, I2C_CLOCK_SPEED);
     
-    // Bus Recovery
     pinMode(I2C_SDA_PIN, INPUT_PULLUP);
     pinMode(I2C_SCL_PIN, INPUT_PULLUP);
     digitalWrite(I2C_SDA_PIN, HIGH);
@@ -318,7 +392,7 @@ void setup() {
     Wire.end(); 
     Wire.setPins(I2C_SDA_PIN, I2C_SCL_PIN);
     Wire.begin();
-    Wire.setClock(I2C_CLOCK_SPEED); // 100kHz Standard Mode
+    Wire.setClock(I2C_CLOCK_SPEED); 
     delay(100); 
 
     Serial.println("[HARDWARE] Allocating Sensor...");
@@ -326,7 +400,6 @@ void setup() {
     accel = new Adafruit_ADXL345_Unified(12345);
 
     if(!accel->begin(0x53)) {
-        Serial.println("[WARN] Try 0x1D...");
         if(!accel->begin(0x1D)) {
             Serial.println("[FATAL] Sensor Hardware Error.");
         }
@@ -336,7 +409,7 @@ void setup() {
         Serial.println("[SYS] Sensor OK.");
     }
 
-    // 4. RTOS
+    // 6. START TASKS
     eventQueue = xQueueCreate(20, sizeof(SeismicEvent));
     xTaskCreate(sensorTask, "SensorTask", 4096, NULL, 5, NULL);
     xTaskCreate(networkTask, "NetworkTask", 8192, NULL, 1, NULL);
