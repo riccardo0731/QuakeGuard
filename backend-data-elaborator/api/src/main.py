@@ -89,14 +89,22 @@ class ConnectionManager:
     def disconnect(self, websocket: WebSocket) -> None:
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
+            print(f"📱 Client Disconnected. Active: {len(self.active_connections)}")
 
     async def broadcast(self, message: str) -> None:
         """Pushes a message to all connected clients."""
+        dead_connections = []
         for connection in self.active_connections:
             try:
                 await connection.send_text(message)
-            except Exception:
-                pass  # Client disconnected abruptly
+            except Exception as e:
+                # FIXED [B110:try_except_pass]: We now log the exception and schedule cleanup
+                print(f"⚠️ Failed to broadcast to a client: {e}")
+                dead_connections.append(connection)
+                
+        # Clean up any connections that threw errors
+        for dead in dead_connections:
+            self.disconnect(dead)
 
 manager = ConnectionManager()
 
@@ -260,7 +268,6 @@ def create_misurator(misurator: schemas.MisuratorCreate, db: Session = Depends(g
 def get_misurators(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
     return db.query(models.Misurator).offset(skip).limit(limit).all()
 
-# Added the rate_limiter dependency here
 @app.post("/misurations/", status_code=status.HTTP_202_ACCEPTED, tags=["Ingestion"], dependencies=[Depends(rate_limiter)])
 async def create_misuration_async(misuration: schemas.MisurationCreate, db: Session = Depends(get_db)):
     misurator = db.query(models.Misurator).filter(models.Misurator.id == misuration.misurator_id).first()
