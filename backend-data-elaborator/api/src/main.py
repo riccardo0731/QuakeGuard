@@ -32,6 +32,40 @@ from src.database import get_db, engine
 import src.models as models
 import src.schemas as schemas
 
+# --- CONFIGURATION ---
+MAX_TIMESTAMP_SKEW = 60
+REDIS_URL = "redis://redis:6379/0"
+
+# ⚠️ SECURITY: Shared Secret for Device Provisioning (Must match Firmware)
+ENROLLMENT_TOKEN = os.getenv("ENROLLMENT_TOKEN", "S3cret_Qu4k3_K3y")
+
+# ==========================================
+# WEBSOCKET CONNECTION MANAGER
+# ==========================================
+
+class ConnectionManager:
+    """Manages active WebSocket connections for broadcasting alerts."""
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        # print(f"📱 Client Connected. Active: {len(self.active_connections)}")
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: str):
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except Exception:
+                pass
+
+ws_manager = ConnectionManager()
+
 # ==========================================
 # INFRASTRUCTURE INITIALIZATION
 # ==========================================
@@ -241,11 +275,9 @@ def get_sensor_statistics(misurator_id: int, db: Session = Depends(get_db)):
     ).filter(models.Misuration.misurator_id == misurator_id).first()
     
     return {
-        "misurator_id": misurator_id,
-        "total_readings": stats.count,
+        "misurator_id": misurator_id, "total_readings": stats.count,
         "average_value": round(stats.average, 2) if stats.average else 0.0,
-        "max_recorded": stats.max_value,
-        "min_recorded": stats.min_value,
+        "max_recorded": stats.max_value, "min_recorded": stats.min_value,
         "generated_at": datetime.utcnow().isoformat()
     }
 
