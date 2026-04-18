@@ -117,9 +117,11 @@ class ConnectionManager:
         for connection in self.active_connections:
             try:
                 await connection.send_text(message)
-            except Exception:
-                pass  # Client disconnected abruptly
-
+            except Exception as e:
+                # FIX: We log the error here instead of using 'pass'
+                print(f"⚠️ Client disconnected abruptly. Error: {e}")
+                self.disconnect(connection)
+                
 manager = ConnectionManager()
 
 async def redis_alert_listener() -> None:
