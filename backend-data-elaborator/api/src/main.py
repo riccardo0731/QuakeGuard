@@ -63,7 +63,7 @@ class ConnectionManager:
             try:
                 await connection.send_text(message)
             except Exception as e:
-                # FIX: Log the error instead of passing silently
+                # FIX: Log the error instead of 'pass'
                 print(f"⚠️ Warning: Failed to broadcast to a client. Error: {e}")
                 self.disconnect(connection)
 
