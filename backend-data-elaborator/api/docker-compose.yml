@@ -1,36 +1,38 @@
 version: '3.8'
 
 services:
-  # --- PERSISTENCE LAYER (PostgreSQL + PostGIS) ---
+  # --- DATABASE ---
   postgres:
     image: postgis/postgis:15-3.4-alpine
+    restart: unless-stopped
+    command: postgres -c 'max_connections=200' -c 'shared_buffers=128MB'
     environment:
-      POSTGRES_DB: monitoraggio_db
-      POSTGRES_USER: developer
-      POSTGRES_PASSWORD: password
-    ports:
-      - "5432:5432"
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U developer -d monitoraggio_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 5
 
-  # --- MESSAGE BROKER & CACHING LAYER ---
+  # --- REDIS ---
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
 
-  # --- INGESTION API (Asynchronous FastAPI) ---
+  # --- API ---
   fastapi-app:
     build: .
+    restart: always
     ports:
-      - "8000:8000"
+      - "${API_PORT}:8000"
     environment:
-      - DATABASE_URL=postgresql://developer:password@postgres:5432/monitoraggio_db
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       - REDIS_URL=redis://redis:6379/0
     depends_on:
       postgres:
@@ -38,12 +40,13 @@ services:
       redis:
         condition: service_started
 
-  # --- BACKGROUND WORKER (Consumer & Alert Logic) ---
+  # --- WORKER ---
   worker:
     build: .
+    restart: always
     command: python src/worker.py
     environment:
-      - DATABASE_URL=postgresql://developer:password@postgres:5432/monitoraggio_db
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       - REDIS_URL=redis://redis:6379/0
     depends_on:
       - redis
@@ -51,3 +54,4 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:

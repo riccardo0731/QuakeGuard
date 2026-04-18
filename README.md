@@ -1,34 +1,102 @@
-# QuakeGuard 🌋
-### Electro-Domestic Earthquake Alarm System
+<div align="center">
 
-**Project Status:** Active Development (Alpha)
+# 🌋 QuakeGuard 
+### Electro-Domestic Seismic Alarm System
 
-## 📖 Overview
-QuakeGuard is a full-stack IoT solution designed to detect, analyze, and visualize seismic activity in domestic environments. The system utilizes low-cost hardware (ESP32) to capture vibration data, securely transmits it to a central server via ECDSA-signed payloads, and visualizes alerts and status via a mobile application.
+**Full-Stack IoT Architecture for Real-Time Earthquake Detection**
 
-## 🏗 Project Architecture
+![C++](https://img.shields.io/badge/C++-Hardware_Logic-00599C?style=for-the-badge&logo=c%2B%2B&logoColor=white)
+![Python](https://img.shields.io/badge/Python-FastAPI-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)
+![React Native](https://img.shields.io/badge/React_Native-Mobile-20232A?style=for-the-badge&logo=react&logoColor=61DAFB)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-PostGIS-316192?style=for-the-badge&logo=postgresql&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis-Message_Broker-DC382D?style=for-the-badge&logo=redis&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Containerization-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 
-The repository is organized into three distinct modules:
-
-* **📂 backend-data-elaborator:** The brain of the system. A FastAPI server with a PostgreSQL/PostGIS database. It handles device registration, cryptographic verification, data ingestion, and seismic alert logic.
-* **📂 frontend-mobile-app:** The user interface. A React Native (Expo) application for monitoring sensor status, viewing real-time alerts, and managing devices.
-* **📂 iot-data-harvester:** The edge layer. Firmware for ESP32-C3 SuperMini connected to ADXL345 accelerometers. It handles sampling, signing, and transmission.
-
-## 🚀 Quick Start Guide
-
-To run the entire ecosystem locally, follow this order of operations:
-
-1.  **Start the Backend:**
-    Navigate to `backend-data-elaborator` and launch the Docker containers. The database must be running for the other components to work.
-2.  **Flash the Firmware:**
-    Configure and flash the ESP32 devices in `iot-data-harvester`. Ensure they have the correct Public/Private keys.
-3.  **Launch the Mobile App:**
-    Navigate to `frontend-mobile-app` and start the Expo server to connect via your smartphone.
-
-## 🔐 Security Architecture
-The system implements **ECDSA (Elliptic Curve Digital Signature Algorithm)** on curve **NIST256p**.
-* **Device:** Holds the Private Key. Signs payload `value:timestamp`.
-* **Server:** Holds the Public Key. Verifies the signature before accepting data.
+</div>
 
 ---
-*For detailed instructions, refer to the README.md files within each subdirectory.*
+
+## 📖 Overview
+**QuakeGuard** is an advanced Full-Stack IoT architecture designed for the real-time detection, analysis, and reporting of seismic events. 
+
+The system utilizes intelligent edge sensors (ESP32) that analyze vibrations locally and transmit cryptographically secured data to an asynchronous hybrid Cloud. The backend is specifically engineered to handle the massive traffic spikes (**Thundering Herd** effect) typical during widespread earthquake events, ensuring reliable alarm delivery without bottlenecking.
+
+---
+
+## 🏗 System Architecture
+
+
+The project is highly modular, following **Microservices** and **Event-Driven Design** principles across three main layers:
+
+### 1. 📡 IoT Edge (Data Harvester)
+* **Hardware:** ESP32-C3 SuperMini paired with an ADXL345 Accelerometer.
+* **Edge Computing:** 100Hz sampling rate, applying Digital High-Pass Filters (HPF) and the **STA/LTA** (Short Term/Long Term Average) seismic algorithm directly on the device.
+* **Security:** Hardware-level digital signing of payloads using **ECDSA (NIST256p)**.
+* **Resilience:** Temporal timestamp reconstruction to mitigate network latency and out-of-order packet deliveries.
+
+### 2. ☁️ Backend (Data Elaborator)
+* **Core API:** Built with **FastAPI** (Python) for high-performance asynchronous routing.
+* **Event Pattern:** Producer-Consumer architecture leveraging **Redis** as a Message Broker to decouple ingestion from processing.
+* **Persistence:** **PostgreSQL + PostGIS** for robust geospatial data management.
+* **Background Workers:** Dedicated processes for queue consumption, event validation, and alarm aggregation.
+* **Performance:** Fully asynchronous management capable of handling >500 Req/s on standard commercial hardware.
+
+### 3. 📱 Frontend (Mobile Monitor)
+* **Framework:** **React Native** (Expo) for cross-platform compatibility.
+* **Features:** Interactive dashboard with real-time visual and haptic alarms via Adaptive Polling, alongside a live sensor network map.
+
+---
+
+## 🔐 Security & Cryptography
+
+Data integrity is paramount in emergency systems. Every telemetry packet transmitted by the edge sensors is cryptographically signed.
+
+```json
+{ 
+  "value": 250, 
+  "timestamp": 17000000, 
+  "signature": "a1b2c3d4e5f6..." 
+}
+```
+
+The backend rigorously verifies the signature (**SHA256 + ECDSA**) against the sensor's registered public key before accepting the payload. This architecture strictly prevents **Man-in-the-Middle** (MitM) and **Spoofing** attacks, ensuring that alarms cannot be falsely triggered by malicious actors.
+
+---
+
+## 🚀 Quick Start (Local Deployment)
+
+### Prerequisites
+* Docker & Docker Compose
+* PlatformIO (VS Code Extension)
+* Node.js & Expo Go (Mobile App)
+
+### 1. Launch the Cloud Backend
+Deploy the API, Database, and Message Broker via Docker:
+```bash
+cd "Backend - Data Elaborator"
+docker-compose up --build -d
+```
+*The backend will be live at `http://localhost:8000`. API documentation is auto-generated at `http://localhost:8000/docs`.*
+
+### 2. Configure and Flash the IoT Edge Device
+1. Modify `IoT - Data Harvester/esp32_config.env` with your local IP and WiFi credentials.
+2. Upload the firmware to the ESP32 via PlatformIO.
+3. **⚠️ IMPORTANT:** On the first boot, copy the generated `PUBLIC KEY` from the serial monitor and register the device via the Swagger UI (`http://localhost:8000/docs`).
+
+### 3. Launch the Mobile Dashboard
+```bash
+cd "Frontend - Mobile App"
+npm install
+npx expo start
+```
+*Scan the generated QR code with your smartphone (ensure your phone is on the same WiFi network as your backend).*
+
+---
+
+<div align="center">
+
+**Developed by [GiZano](https://giovanni-zanotti.is-a.dev)**
+<br>
+*Version 3.0.0 (Stable) | MIT License*
+
+</div>
