@@ -182,8 +182,8 @@ async def main():
         load_stats = await run_load_test(session, sensors, sem)
         
         # FIX: Sleep to let the 1-second Redis Rate Limiter reset so Phase 2 doesn't get blocked by 429
-        print("\n⏳ Letting Redis Rate Limiter cool down for 2 seconds...")
-        await asyncio.sleep(2)
+        print("\n⏳ Letting Redis Rate Limiter cool down for 10 seconds...")
+        await asyncio.sleep(10)
         
         sec_stats = await run_security_test(session, zone_id, sem)
         e2e_passed = await verify_persistence_with_polling(session, sensors, sem)

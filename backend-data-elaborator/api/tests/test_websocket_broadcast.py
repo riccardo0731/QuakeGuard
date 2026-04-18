@@ -14,7 +14,7 @@ import os
 import redis.asyncio as aioredis
 
 # Assumes the backend is running locally on port 8000
-WS_URI = "ws://127.0.0.1:8000/ws/alerts"
+WS_URI = "ws://127.0.0.1:8000/ws/alerts?token=SecretMobileAppToken2024"
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 NUM_CLIENTS = 100
 

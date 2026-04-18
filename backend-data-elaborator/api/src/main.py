@@ -45,6 +45,9 @@ ENROLLMENT_TOKEN = os.getenv("ENROLLMENT_TOKEN", "S3cret_Qu4k3_K3y")
 # ⚠️ SECURITY: API Key for IoT Endpoints
 IOT_API_KEY = os.getenv("IOT_API_KEY", "SuperSecretIoTKey2024")
 
+# ⚠️ SECURITY: Token for Mobile App WebSocket connections
+MOBILE_WS_TOKEN = os.getenv("MOBILE_WS_TOKEN", "SecretMobileAppToken2024")
+
 # ==========================================
 # INFRASTRUCTURE INITIALIZATION
 # ==========================================
@@ -172,10 +175,18 @@ async def rate_limiter(request: Request):
 @app.websocket("/ws/alerts")
 async def websocket_endpoint(websocket: WebSocket):
     """Clients connect here to receive real-time updates."""
+    
+    # Extract the token from the connection query parameters
+    token = websocket.query_params.get("token")
+    
+    # Reject unauthorized WebSocket connections instantly
+    if token != MOBILE_WS_TOKEN:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+        
     await manager.connect(websocket)
     try:
         while True:
-            # Keep the connection open. We only send data out, we don't expect data in.
             await websocket.receive_text()
     except (WebSocketDisconnect, Exception):
         manager.disconnect(websocket)
@@ -283,3 +294,16 @@ async def create_misuration_async(misuration: schemas.MisurationCreate, db: Sess
     # Offload the rest to the Redis queue for async processing
     await redis_client.lpush("seismic_events", json.dumps(payload))
     return {"status": "accepted"}
+
+@app.get("/sensors/{id}/statistics", tags=["Data Retrieval"])
+def get_sensor_statistics(id: int, db: Session = Depends(get_db)):
+    """
+    Returns the total number of readings for a specific sensor.
+    """
+    count = db.query(models.Misuration).filter(models.Misuration.misurator_id == id).count()
+    
+    # We can expand this later with Avg/Min/Max
+    return {
+        "sensor_id": id,
+        "total_readings": count
+    }
