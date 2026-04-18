@@ -98,7 +98,6 @@ class ConnectionManager:
             try:
                 await connection.send_text(message)
             except Exception as e:
-                # FIXED [B110:try_except_pass]: We now log the exception and schedule cleanup
                 print(f"⚠️ Failed to broadcast to a client: {e}")
                 dead_connections.append(connection)
                 
@@ -122,8 +121,10 @@ async def redis_alert_listener() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manages the startup and shutdown lifecycle of the FastAPI app."""
+    # Start the Pub/Sub listener in the background when the server starts
     listener_task = asyncio.create_task(redis_alert_listener())
     yield
+    # Clean up when the server shuts down
     listener_task.cancel()
 
 # 3. Initialize FastAPI
@@ -135,11 +136,9 @@ app = FastAPI(title="QuakeGuard Backend", version="2.2.0", lifespan=lifespan)
 
 class IoTAuthenticationMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Exclude public endpoints, websockets, and health checks from Auth
         if request.url.path.startswith(("/docs", "/openapi", "/health", "/ws")):
             return await call_next(request)
             
-        # Extract the key from headers
         api_key = request.headers.get("X-API-Key")
         
         if api_key != IOT_API_KEY:
@@ -153,37 +152,30 @@ class IoTAuthenticationMiddleware(BaseHTTPMiddleware):
 app.add_middleware(IoTAuthenticationMiddleware)
 
 async def rate_limiter(request: Request):
-    """
-    Fixed-window rate limiter using Redis. 
-    Restricts ingestion per IP to prevent Thundering Herd / DoS attacks.
-    """
+    """Fixed-window rate limiter using Redis."""
     client_ip = request.client.host
     current_second = int(time.time())
-    
-    # Create a unique Redis key for this IP for the current second
     key = f"rate_limit:{client_ip}:{current_second}"
     
-    # Increment the request count
     request_count = await redis_client.incr(key)
     
-    # Set expiration on the key the first time it is created
     if request_count == 1:
         await redis_client.expire(key, 5) 
         
-    # Threshold: Allow max 50 requests per second per IP
     if request_count > 50:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Rate limit exceeded. Too many requests from this IP."
         )
 
-
+# --- TASK #28: WEBSOCKET ENDPOINT ---
 @app.websocket("/ws/alerts")
 async def websocket_endpoint(websocket: WebSocket):
     """Clients connect here to receive real-time updates."""
     await manager.connect(websocket)
     try:
         while True:
+            # Keep the connection open. We only send data out, we don't expect data in.
             await websocket.receive_text()
     except (WebSocketDisconnect, Exception):
         manager.disconnect(websocket)
@@ -193,10 +185,6 @@ async def websocket_endpoint(websocket: WebSocket):
 # ==========================================
 
 def verify_device_signature(public_key_hex: str, message: str, signature_hex: str) -> bool:
-    """
-    Verifies ECDSA signature (NIST256p + SHA256).
-    Supports DER (MbedTLS) and RAW formats.
-    """
     if not public_key_hex or not signature_hex:
         return False
         
