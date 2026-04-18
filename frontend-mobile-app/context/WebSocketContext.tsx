@@ -1,16 +1,17 @@
 import React, {
-    createContext,
-    ReactNode,
-    useContext,
-    useEffect,
-    useRef,
-    useState,
+  createContext,
+  ReactNode,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+  useCallback,
 } from "react";
 import { Vibration } from "react-native";
 import { API_BASE_URL } from "../constants/config";
 
-// Definizione Tipi
-interface AlertMessage {
+// --- TYPES & INTERFACES ---
+export interface AlertMessage {
   type: string;
   zone_id: number;
   magnitude: number;
@@ -25,61 +26,91 @@ interface WebSocketContextType {
 
 const WebSocketContext = createContext<WebSocketContextType | null>(null);
 
-export const WebSocketProvider = ({ children }: { children: ReactNode }) => {
-  const [isConnected, setIsConnected] = useState(false);
-  const [lastAlert, setLastAlert] = useState<AlertMessage | null>(null);
-  const ws = useRef<WebSocket | null>(null);
+// --- CONSTANTS ---
+const SOS_VIBRATION_PATTERN = [
+  0, 200, 100, 200, 100, 200, // 3 short
+  300, 500, 300, 500, 300, 500, // 3 long
+  300, 200, 100, 200, 100, 200, // 3 short
+];
 
-  const connect = () => {
-    // Sostituisci http con ws nell'URL
+const MAX_RECONNECT_DELAY = 30000; // 30 seconds max backoff
+
+export const WebSocketProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
+  const [isConnected, setIsConnected] = useState<boolean>(false);
+  const [lastAlert, setLastAlert] = useState<AlertMessage | null>(null);
+  
+  const ws = useRef<WebSocket | null>(null);
+  const reconnectTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);  const reconnectAttempts = useRef<number>(0);
+  
+
+  const connect = useCallback(() => {
+    // Prevent multiple simultaneous connections
+    if (ws.current?.readyState === WebSocket.OPEN) return;
+
     const wsUrl = API_BASE_URL.replace("http", "ws") + "/ws/alerts";
-    console.log("🔌 Tentativo connessione WS:", wsUrl);
+    console.log(`🔌 Attempting WS Connection: ${wsUrl}`);
 
     ws.current = new WebSocket(wsUrl);
 
     ws.current.onopen = () => {
-      console.log("✅ WS Connesso");
+      console.log("✅ WS Connected Successfully");
       setIsConnected(true);
+      reconnectAttempts.current = 0; // Reset backoff on success
     };
 
-    ws.current.onmessage = (e) => {
+    ws.current.onmessage = (event: WebSocketMessageEvent) => {
       try {
-        const message: AlertMessage = JSON.parse(e.data);
-        console.log("⚡ ALERT RICEVUTO:", message);
+        const message: AlertMessage = JSON.parse(event.data);
+        console.log("⚡ ALERT RECEIVED:", message);
 
         setLastAlert(message);
 
-        // Feedback immediato se critico
+        // Immediate Haptic Feedback for Critical Alerts
         if (message.type === "CRITICAL") {
-          // Vibrazione pattern SOS (3 brevi, 3 lunghi, 3 brevi)
-          Vibration.vibrate([
-            0, 200, 100, 200, 100, 200, 300, 500, 300, 500, 300, 500, 300, 200,
-            100, 200, 100, 200,
-          ]);
+          Vibration.vibrate(SOS_VIBRATION_PATTERN);
         }
       } catch (err) {
-        console.error("Errore parsing messaggio WS", err);
+        console.error("❌ Error parsing WS message:", err);
       }
     };
 
     ws.current.onclose = () => {
-      console.log("❌ WS Disconnesso");
+      console.log("❌ WS Disconnected");
       setIsConnected(false);
-      // Riprova a connetterti tra 5 secondi (Reconnection Logic)
-      setTimeout(connect, 5000);
+      scheduleReconnection();
     };
 
-    ws.current.onerror = (e) => {
-      console.log("⚠️ WS Errore:", e);
+    ws.current.onerror = (error: Event) => {
+      console.error("⚠️ WS Error:", error);
+      // onclose will automatically fire after onerror
     };
-  };
+  }, []);
+
+  const scheduleReconnection = useCallback(() => {
+    // Exponential backoff logic: 1s, 2s, 4s, 8s... up to 30s
+    const delay = Math.min(
+      1000 * Math.pow(2, reconnectAttempts.current),
+      MAX_RECONNECT_DELAY
+    );
+    
+    console.log(`⏳ Reconnecting in ${delay / 1000} seconds...`);
+    reconnectTimeout.current = setTimeout(() => {
+      reconnectAttempts.current += 1;
+      connect();
+    }, delay);
+  }, [connect]);
 
   useEffect(() => {
     connect();
+
+    // Cleanup function on unmount
     return () => {
+      if (reconnectTimeout.current) {
+        clearTimeout(reconnectTimeout.current);
+      }
       ws.current?.close();
     };
-  }, []);
+  }, [connect]);
 
   return (
     <WebSocketContext.Provider value={{ isConnected, lastAlert }}>
@@ -88,13 +119,11 @@ export const WebSocketProvider = ({ children }: { children: ReactNode }) => {
   );
 };
 
-// Hook custom per usare il context facilmente
-export const useWebSocket = () => {
+// Custom Hook for safe context consumption
+export const useWebSocket = (): WebSocketContextType => {
   const context = useContext(WebSocketContext);
   if (!context) {
-    throw new Error(
-      "useWebSocket deve essere usato dentro un WebSocketProvider",
-    );
+    throw new Error("useWebSocket must be used within a WebSocketProvider");
   }
   return context;
 };
