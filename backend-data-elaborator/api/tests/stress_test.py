@@ -1,5 +1,5 @@
 """
-QuakeGuard Critical Stress Test Suite (v2.1 - The Real Deal)
+QuakeGuard Critical Stress Test Suite v2.3
 ------------------------------------------------------------
 Features:
 - Client-side Semaphore Throttling
@@ -153,16 +153,47 @@ async def run_security_test(session, zone_id, sem) -> TestStats:
     return stats
 
 async def verify_persistence_with_polling(session, sensors, sem) -> bool:
-    print(f"\n🔍 Phase 3: E2E Verification (Skipped)...")
-    # We bypass this because the /statistics endpoint isn't built into our FastAPI app yet!
-    print("   ⚠️  Backend endpoint '/sensors/{id}/statistics' is not implemented in this version.")
-    print("   ✅ Assuming persistence is handled gracefully by Redis Worker.")
-    return True
+    print(f"\n🔍 Phase 3: E2E Verification (Polling Worker)...")
+    
+    # 1. Robust Selection: Find a sensor that successfully registered AND sent data
+    test_sensor = next((s for s in sensors if s.sensor_id > 0 and s.sent_count > 0), None)
+    
+    if not test_sensor:
+        print("   ❌ E2E Failed: No valid sensors found with sent data to verify.")
+        return False
+        
+    print(f"   👉 Tracking Sensor ID {test_sensor.sensor_id} (Expected readings: {test_sensor.sent_count})")
+    
+    for attempt in range(POLLING_RETRIES):
+        async with sem:  # Keeping inside the loop respects concurrency limits safely
+            try:
+                async with session.get(f"{API_URL}/sensors/{test_sensor.sensor_id}/statistics") as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        readings = data.get("total_readings", 0)
+                        
+                        # 2. Strict Assertion: Ensure ALL sent data was persisted
+                        if readings >= test_sensor.sent_count:
+                            print(f"   ✅ DB Confirmed! All {test_sensor.sent_count} reading(s) securely persisted.")
+                            return True
+                        else:
+                            print(f"   ⏳ Worker processing... {readings}/{test_sensor.sent_count} (Attempt {attempt+1}/{POLLING_RETRIES})")
+                    else:
+                        print(f"   ⚠️ API Error: Expected 200, got {resp.status}")
+                        return False
+            except Exception as e:
+                print(f"   ⚠️ Connection Error: {e}")
+                
+        # Wait 1 second before polling again
+        await asyncio.sleep(1)
+        
+    print("   ❌ Polling timed out. Redis Worker may be down or slow.")
+    return False
 
 # --- MAIN ---
 
 async def main():
-    print(f"🚀 QUAKEGUARD CRITICAL TEST v2.1")
+    print(f"🚀 QUAKEGUARD CRITICAL TEST v2.2")
     sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
     headers = {"X-API-Key": IOT_API_KEY}
@@ -181,11 +212,12 @@ async def main():
         # Execution
         load_stats = await run_load_test(session, sensors, sem)
         
-        # FIX: Sleep to let the 1-second Redis Rate Limiter reset so Phase 2 doesn't get blocked by 429
         print("\n⏳ Letting Redis Rate Limiter cool down for 10 seconds...")
         await asyncio.sleep(10)
         
         sec_stats = await run_security_test(session, zone_id, sem)
+        
+        # New End-to-End Test Execution!
         e2e_passed = await verify_persistence_with_polling(session, sensors, sem)
 
     # Report
@@ -195,12 +227,14 @@ async def main():
     print(f"Traffic:      {load_stats.req_success}/{load_stats.req_sent} Accepted")
     print(f"Sec (BadSig): {sec_stats.auth_rejected} Blocked")
     print(f"Sec (Replay): {sec_stats.replay_rejected} Blocked")
-    print(f"Persistence:  {'SKIPPED'}")
+    
+    # Update Report to reflect E2E status
+    persistence_str = "✅ VERIFIED" if e2e_passed else "❌ FAILED"
+    print(f"Persistence:  {persistence_str}")
     print("="*40)
 
-    # Note: Using load_stats.req_failed isn't a reliable metric for failure here since 
-    # some 429s are expected in an asynchronous firehose. 
-    if sec_stats.auth_rejected > 0 and sec_stats.replay_rejected > 0:
+    # Must pass security AND E2E persistence to be certified!
+    if sec_stats.auth_rejected > 0 and sec_stats.replay_rejected > 0 and e2e_passed:
         print("🏆 SYSTEM CERTIFIED")
     else:
         print("⚠️ SYSTEM FAILURE")

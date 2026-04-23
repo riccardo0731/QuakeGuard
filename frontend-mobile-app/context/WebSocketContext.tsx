@@ -8,7 +8,8 @@ import React, {
   useCallback,
 } from "react";
 import { Vibration } from "react-native";
-import { API_BASE_URL } from "../constants/config";
+// 💡 IMPORT MOBILE_WS_TOKEN HERE
+import { API_BASE_URL, MOBILE_WS_TOKEN } from "../constants/config";
 
 // --- TYPES & INTERFACES ---
 export interface AlertMessage {
@@ -40,14 +41,14 @@ export const WebSocketProvider: React.FC<{ children: ReactNode }> = ({ children 
   const [lastAlert, setLastAlert] = useState<AlertMessage | null>(null);
   
   const ws = useRef<WebSocket | null>(null);
-  const reconnectTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);  const reconnectAttempts = useRef<number>(0);
+  const reconnectTimeout = useRef<ReturnType<typeof setTimeout> | null>(null); 
+  const reconnectAttempts = useRef<number>(0);
   
-
   const connect = useCallback(() => {
-    // Prevent multiple simultaneous connections
     if (ws.current?.readyState === WebSocket.OPEN) return;
 
-    const wsUrl = API_BASE_URL.replace("http", "ws") + "/ws/alerts";
+    // 💡 USE THE IMPORTED TOKEN HERE
+    const wsUrl = `${API_BASE_URL.replace("http", "ws")}/ws/alerts?token=${MOBILE_WS_TOKEN}`;
     console.log(`🔌 Attempting WS Connection: ${wsUrl}`);
 
     ws.current = new WebSocket(wsUrl);
@@ -55,7 +56,7 @@ export const WebSocketProvider: React.FC<{ children: ReactNode }> = ({ children 
     ws.current.onopen = () => {
       console.log("✅ WS Connected Successfully");
       setIsConnected(true);
-      reconnectAttempts.current = 0; // Reset backoff on success
+      reconnectAttempts.current = 0;
     };
 
     ws.current.onmessage = (event: WebSocketMessageEvent) => {
@@ -65,7 +66,6 @@ export const WebSocketProvider: React.FC<{ children: ReactNode }> = ({ children 
 
         setLastAlert(message);
 
-        // Immediate Haptic Feedback for Critical Alerts
         if (message.type === "CRITICAL") {
           Vibration.vibrate(SOS_VIBRATION_PATTERN);
         }
@@ -82,12 +82,10 @@ export const WebSocketProvider: React.FC<{ children: ReactNode }> = ({ children 
 
     ws.current.onerror = (error: Event) => {
       console.error("⚠️ WS Error:", error);
-      // onclose will automatically fire after onerror
     };
   }, []);
 
   const scheduleReconnection = useCallback(() => {
-    // Exponential backoff logic: 1s, 2s, 4s, 8s... up to 30s
     const delay = Math.min(
       1000 * Math.pow(2, reconnectAttempts.current),
       MAX_RECONNECT_DELAY
@@ -102,8 +100,6 @@ export const WebSocketProvider: React.FC<{ children: ReactNode }> = ({ children 
 
   useEffect(() => {
     connect();
-
-    // Cleanup function on unmount
     return () => {
       if (reconnectTimeout.current) {
         clearTimeout(reconnectTimeout.current);
@@ -119,7 +115,6 @@ export const WebSocketProvider: React.FC<{ children: ReactNode }> = ({ children 
   );
 };
 
-// Custom Hook for safe context consumption
 export const useWebSocket = (): WebSocketContextType => {
   const context = useContext(WebSocketContext);
   if (!context) {
