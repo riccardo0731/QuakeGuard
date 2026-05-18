@@ -15,7 +15,13 @@ class Zone(Base):
     __tablename__ = "zones"
 
     id = Column(Integer, primary_key=True, index=True)
-    city = Column(String(100), nullable=False)
+    city = Column(String(100), nullable=False, unique=True)
+    
+    # Auditability timestamp
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    
+    # PostGIS Polygon boundary for automatic sensor assignment
+    geom = Column(Geometry('POLYGON', srid=4326), nullable=True)
 
     # Relationships
     misurators = relationship("Misurator", back_populates="zone", cascade="all, delete-orphan")
@@ -56,7 +62,7 @@ class Misuration(Base):
     __tablename__ = "misurations"
 
     id = Column(Integer, primary_key=True, index=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    recorded_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
     value = Column(Integer, nullable=False)
     
     misurator_id = Column(Integer, ForeignKey("misurators.id"), nullable=False)

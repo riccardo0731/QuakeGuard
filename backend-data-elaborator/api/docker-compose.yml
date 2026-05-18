@@ -21,6 +21,8 @@ services:
   # --- REDIS ---
   redis:
     image: redis:7-alpine
+    ports:
+      - "6379:6379"
     restart: unless-stopped
     volumes:
       - redis_data:/data
@@ -34,11 +36,19 @@ services:
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       - REDIS_URL=redis://redis:6379/0
+      - IOT_API_KEY=${IOT_API_KEY}
+      - MOBILE_WS_TOKEN=${MOBILE_WS_TOKEN}
+      - ENROLLMENT_TOKEN=${ENROLLMENT_TOKEN}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # --- WORKER ---
   worker:
@@ -50,8 +60,38 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - PYTHONUNBUFFERED=1
     depends_on:
-      - redis
-      - postgres
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  # --- MQTT BROKER ---
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports:
+      - "${MQTT_PORT}:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/#", "-C", "1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # --- MQTT BRIDGE ---
+  mqtt-bridge:
+    build: .
+    restart: always
+    command: python src/mqtt_subscriber.py
+    environment:
+      - MQTT_BROKER=mosquitto
+      - IOT_API_KEY=${IOT_API_KEY}
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+      fastapi-app:
+        condition: service_healthy
 
 volumes:
   postgres_data:
